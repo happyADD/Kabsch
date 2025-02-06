@@ -1,199 +1,129 @@
 #include <iostream>
-#include <vector>
-#include <opencv2/core.hpp>
 #include <Eigen/Dense>
-#include <chrono>
-#include <random>
+#include <vector>
 #include <cmath>
+#include <random>
+#include <chrono>
 
-using namespace std;
-using namespace cv;
 using namespace Eigen;
 
-// 计算点集的质心
-array<float, 3> centroid(const vector<array<float, 3>>& points)
+std::pair<Matrix3d, Vector3d> randomRT()
 {
-    array<float, 3> sum = {0.0f, 0.0f, 0.0f}; // 初始化质心为零向量
-    for (const auto& point : points)
-    {
-        // 遍历每个点
-        sum[0] += point[0];
-        sum[1] += point[1];
-        sum[2] += point[2];
-    }
-    float size = static_cast<float>(points.size());
-    return {sum[0] / size, sum[1] / size, sum[2] / size}; // 返回平均值作为质心
+	std::random_device rd;
+	std::mt19937 gen(rd());
+	std::normal_distribution<> d(0, 0.1);
+
+	// 随机生成一个三维向量并归一化
+	Vector3d v(d(gen), d(gen), d(gen));
+	v.normalize();
+
+	// 随机生成旋转角度
+	double theta = 2 * M_PI * ((double)rand() / RAND_MAX) ;
+
+	// 计算旋转矩阵元素
+	double c = cos(theta);
+	double s = sin(theta);
+	double t = 1 - c;
+	double x = v(0), y = v(1), z = v(2);
+
+	Matrix3d R;
+	R << t * x * x + c, t * x * y - s * z, t * x * z + s * y,
+		t * x * y + s * z, t * y * y + c, t * y * z - s * x,
+		t * x * z - s * y, t * y * z + s * x, t * z * z + c;
+
+	// 随机生成平移向量
+	Vector3d T(d(gen), d(gen), d(gen));
+
+	return {R, T};
 }
 
-// Kabsch算法核心部分：计算旋转矩阵
-Matrix3d kabschRotation(const vector<array<float, 3>>& A, const vector<array<float, 3>>& B)
+std::tuple<double, double, double> cal(int point_num, const MatrixXd& points, const MatrixXd& points_measure,
+                                       const Matrix3d& R, const Vector3d& T)
 {
-    // 检查输入是否一致
-    if (A.size() != B.size())
-    {
-        throw runtime_error("Point sets must have the same number of points");
-    }
+	// 质心
+	Vector3d p_r = points.colwise().mean();
+	Vector3d p_m = points_measure.colwise().mean();
 
-    int n = A.size();
+	// 中心化点集
+	MatrixXd q_r = points.rowwise() - p_r.transpose();
+	MatrixXd q_m = points_measure.rowwise() - p_m.transpose();
 
-    MatrixXd H = MatrixXd::Zero(3, 3);
-    for (int i = 0; i < n; ++i)
-    {
-        Vector3d a(A[i][0], A[i][1], A[i][2]);
-        Vector3d b(B[i][0], B[i][1], B[i][2]);
-        H += a * b.transpose();
-    }
+	// 协方差矩阵
+	Matrix3d H = (q_r.transpose() * q_m).eval();
 
-    JacobiSVD<MatrixXd> svd(H, ComputeFullU | ComputeFullV);
+	// 奇异值分解
+	JacobiSVD<MatrixXd> svd(H, ComputeThinU | ComputeThinV);
+	Matrix3d U = svd.matrixU();
+	Matrix3d V = svd.matrixV();
 
-    Matrix3d Vt = svd.matrixV().transpose();
-    Matrix3d R = Vt * svd.matrixU().transpose();
+	// 计算结果
+	Matrix3d R_cal = V * U.transpose();
+	double det_R = R_cal.determinant();
 
-    // 确保R是一个合法的旋转矩阵（det(R) = 1）
-    double d = (svd.matrixV().determinant() * svd.matrixU().determinant()) < 0 ? -1 : 1;
-    Matrix3d U_star = svd.matrixU();
-    U_star.col(2) *= d;
-    R = Vt * U_star.transpose();
+	Vector3d T_cal = p_m - R_cal * p_r;
 
-    return R;
-}
+	Matrix3d R_diff = R * R_cal.transpose();
+	double theta = acos((R_diff.trace() - 1) / 2);
+	double diff_R = theta * 180.0 / M_PI; // 弧度转度
 
-// 将点集投影到平面上
-vector<array<float, 3>> projectToPlane(const vector<array<float, 3>>& points, const Vector3d& normal)
-{
-    vector<array<float, 3>> projectedPoints;
-    for (const auto& point : points)
-    {
-        Vector3d p(point[0], point[1], point[2]);
-        Vector3d projection = p - (p.dot(normal) / normal.squaredNorm()) * normal;
-        projectedPoints.push_back({
-            static_cast<float>(projection.x()),
-            static_cast<float>(projection.y()),
-            static_cast<float>(projection.z())
-        });
-    }
-    return projectedPoints;
-}
+	Vector3d trans_diff = T - T_cal;
+	double diff_T = trans_diff.norm();
 
-void Kabsch(vector<array<float, 3>> points)
-{
-    array<float, 3> center = centroid(points);
-
-    // 移动点集使其质心位于原点
-    vector<array<float, 3>> centeredPoints;
-    for (const auto& point : points)
-    {
-        centeredPoints.push_back({point[0] - center[0], point[1] - center[1], point[2] - center[2]});
-    }
-
-    // 创建一个目标点集，这里假设所有点都在xy平面上
-    vector<array<float, 3>> targetPoints;
-    for (const auto& point : centeredPoints)
-    {
-        targetPoints.push_back({point[0], point[1], 0.0f});
-    }
-
-    // 使用Kabsch算法计算旋转矩阵
-    Matrix3d rotationMatrix = kabschRotation(centeredPoints, targetPoints);
-
-    // 应用旋转矩阵到原始点集上
-    vector<array<float, 3>> rotatedPoints;
-    for (const auto& point : centeredPoints)
-    {
-        Vector3d p(point[0], point[1], point[2]);
-        Vector3d rotatedPoint = rotationMatrix * p;
-        rotatedPoints.push_back({
-            static_cast<float>(rotatedPoint.x()),
-            static_cast<float>(rotatedPoint.y()),
-            static_cast<float>(rotatedPoint.z())
-        });
-    }
-
-    // 获取旋转后的点集的法向量（即z轴方向）
-    Vector3d planeNormal = rotationMatrix.col(2);
-
-    // 将原始点集投影到平面上
-    vector<array<float, 3>> projectedPoints = projectToPlane(rotatedPoints, planeNormal);
-
-    // 输出结果
-    cout << "Original Points:" << endl;
-    for (const auto& point : points)
-    {
-        cout << "(" << point[0] << ", " << point[1] << ", " << point[2] << ")" << endl;
-    }
-
-    cout << "\nProjected Points on Plane:" << endl;
-    for (const auto& point : projectedPoints)
-    {
-        cout << "(" << point[0] << ", " << point[1] << ", " << point[2] << ")" << endl;
-    }
-
-    // 输出拟合平面的解析式
-    // 平面方程 ax + by + cz + d = 0
-    float a = static_cast<float>(planeNormal.x());
-    float b = static_cast<float>(planeNormal.y());
-    float c = static_cast<float>(planeNormal.z());
-    float d = -(a * center[0] + b * center[1] + c * center[2]);
-
-    cout << "\nFitted Plane Equation: " << a << "x + " << b << "y + " << c << "z + " << d << " = 0" << endl;
-}
-
-// Function to generate random numbers following a normal distribution
-float generateNormalDistribution(float mean, float stddev)
-{
-    static std::default_random_engine generator;
-    std::normal_distribution<float> distribution(mean, stddev);
-    return distribution(generator);
-}
-
-// Function to generate a random plane and points around it
-std::pair<std::array<float, 4>, std::vector<std::array<float, 3>>> generateRandomPlaneAndPoints()
-{
-    // Randomly generate coefficients for the plane equation: ax + by + cz = d
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<> dis(-10.0, 10.0);
-
-    float a = dis(gen);
-    float b = dis(gen);
-    float c = dis(gen);
-    float d = dis(gen);
-
-    std::array<float, 4> planeCoefficients = {a, b, c, d};
-
-    // Generate 36 points around the plane with some noise
-    std::vector<std::array<float, 3>> points;
-    for (int i = 0; i < 36; ++i)
-    {
-        float x = generateNormalDistribution(0, 1);
-        float y = generateNormalDistribution(0, 1);
-        float z = (d - a * x - b * y) / c; // Calculate z based on the plane equation
-
-        // Add some noise to the point
-        float noiseX = generateNormalDistribution(0, 0.5);
-        float noiseY = generateNormalDistribution(0, 0.5);
-        float noiseZ = generateNormalDistribution(0, 0.5);
-
-        points.push_back({x + noiseX, y + noiseY, z + noiseZ});
-    }
-
-    return {planeCoefficients, points};
+	return {diff_R, diff_T, det_R};
 }
 
 int main()
 {
-    auto random_data = generateRandomPlaneAndPoints();
-    auto points = random_data.second;
-    auto start = std::chrono::high_resolution_clock::now();
-    Kabsch(points);
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    auto xyz = random_data.first;
-    printf("Real Plane Equation：%f x + %f y + %f z + %f  = 0 \n ",xyz.at(0),xyz.at(1),xyz.at(2),xyz.at(3));
-    std::cout << "Function took " << duration.count() << " milliseconds to execute." << std::endl;
+	int point_num = 50;
+	int for_n = 100000;
+	std::vector<double> err_R, err_T;
+	std::vector<std::chrono::duration<double>> durations;
+	auto t1 = std::chrono::high_resolution_clock::now();
+	for (int j = 0; j < for_n; ++j)
+	{
+		double a = ((double)rand() / RAND_MAX) * 1;
+		double b = ((double)rand() / RAND_MAX) * 1;
+		double c = ((double)rand() / RAND_MAX) * 1;
+		double d = ((double)rand() / RAND_MAX) * 1;
 
-    return 0;
+		MatrixXd points = MatrixXd::Random(point_num, 3);
+		for (int i = 0; i < point_num; ++i)
+		{
+			points(i, 2) = (-d - a * points(i, 0) - b * points(i, 1)) / c;
+		}
+
+		auto [R, T] = randomRT();
+		MatrixXd points_measure = MatrixXd::Zero(point_num, 3);
+		for (int i = 0; i < point_num; ++i)
+		{
+			points_measure.row(i) = R * points.row(i).transpose() + T + MatrixXd::Random(3, 1) * 0.01;
+		}
+
+		auto [diff_R, diff_T, det_R] = cal(point_num, points, points_measure, R, T);
+
+
+
+		if (diff_R > 90) diff_R -= 90;
+		if (det_R > 0.9)
+		{
+			err_R.push_back(diff_R);
+			err_T.push_back(diff_T);
+		}
+		std::cout <<j<< std::endl;
+
+	}
+	auto t2 = std::chrono::high_resolution_clock::now();
+	std::cout << "Finish " << err_R.size() << " in " << for_n << std::endl;
+	std::chrono::duration<double> duration = t2 - t1;
+
+	double mean_R=0, mean_T=0;
+	double n = static_cast<double>(err_R.size());
+	for (int i = 0; i < n; ++i)
+	{
+		mean_R += err_R.at(i);
+		mean_T += err_T.at(i);
+	}
+	std::cout << "avg R error: " << mean_R/n << std::endl;
+	std::cout << "avg T error: " << mean_T/n << std::endl;
+	std::cout << "avg time: " << duration.count()/n << " s"<< std::endl;
 }
-
-
-
